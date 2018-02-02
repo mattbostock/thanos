@@ -17,6 +17,7 @@ import (
 	"github.com/improbable-eng/thanos/pkg/query/ui"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/oklog/run"
+	"github.com/oklog/ulid"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -52,11 +53,14 @@ func registerCompact(m map[string]setupFunc, app *kingpin.Application, name stri
 	s3Insecure := cmd.Flag("s3.insecure", "Whether to use an insecure connection with an S3-Compatible API.").
 		Default("false").Envar("S3_INSECURE").Bool()
 
-	syncDelay := cmd.Flag("sync-delay", "minimum age of blocks before they are being processed.").
+	syncDelay := cmd.Flag("sync-delay", "Minimum age of blocks before they are being processed.").
 		Default("2h").Duration()
 
+	wait := cmd.Flag("wait", "Do not exit after all compactions have been processed and wait wait for now work.").
+		Short('w').Bool()
+
 	m[name] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer) error {
-		return runCompact(g, logger, reg, *httpAddr, *dataDir, *gcsBucket, *s3Bucket, *s3Endpoint, *s3AccessKey, *s3SecretKey, *s3Insecure, *syncDelay)
+		return runCompact(g, logger, reg, *httpAddr, *dataDir, *gcsBucket, *s3Bucket, *s3Endpoint, *s3AccessKey, *s3SecretKey, *s3Insecure, *syncDelay, *wait)
 	}
 }
 
@@ -73,6 +77,7 @@ func runCompact(
 	s3SecretKey string,
 	s3Insecure bool,
 	syncDelay time.Duration,
+	wait bool,
 ) error {
 	var (
 		bkt    objstore.Bucket
@@ -136,8 +141,10 @@ func runCompact(
 
 		ctx, cancel := context.WithCancel(context.Background())
 
-		g.Add(func() error {
-			return runutil.Repeat(5*time.Minute, ctx.Done(), func() error {
+		f := func() error {
+			// Loop over bucket and compact until there's no work left.
+			didWork := false
+			for {
 				if err := sy.SyncMetas(ctx); err != nil {
 					level.Error(logger).Log("msg", "sync failed", "err", err)
 				}
@@ -151,7 +158,11 @@ func runCompact(
 				for _, g := range groups {
 					os.RemoveAll(dataDir)
 					// While we do all compactions sequentially we just compact within the top-level dir.
-					if _, err := g.Compact(ctx, dataDir, comp); err == nil {
+					id, err := g.Compact(ctx, dataDir, comp)
+					if err == nil {
+						if id != (ulid.ULID{}) {
+							didWork = true
+						}
 						continue
 					}
 					level.Error(logger).Log("msg", "compaction failed", "err", err)
@@ -163,8 +174,32 @@ func runCompact(
 						select {}
 					}
 				}
-				return nil
-			})
+				if !didWork {
+					break
+				}
+			}
+			// After all comapctions are done, work down the downsampling backlog.
+			// We run two passes of this to ensure that the 1h downsampling is generated
+			// for 5m downsamplings created in the first run.
+			level.Info(logger).Log("msg", "start first pass of downsampling")
+
+			if err := downsampleBucket(ctx, logger, bkt, dataDir); err != nil {
+				return errors.Wrap(err, "downsampling failed")
+			}
+
+			level.Info(logger).Log("msg", "start second pass of downsampling")
+
+			if err := downsampleBucket(ctx, logger, bkt, dataDir); err != nil {
+				return errors.Wrap(err, "downsampling failed")
+			}
+			return nil
+		}
+
+		g.Add(func() error {
+			if !wait {
+				return f()
+			}
+			return runutil.Repeat(5*time.Minute, ctx.Done(), f)
 		}, func(error) {
 			cancel()
 		})
