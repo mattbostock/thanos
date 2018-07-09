@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"io"
+	"strconv"
 	"testing"
 
 	"time"
@@ -167,6 +168,68 @@ func TestQueryStore_Series(t *testing.T) {
 
 	// We should have all warnings given by all our clients too.
 	testutil.Equals(t, 2, len(s2.Warnings))
+}
+
+func TestProxyStore_SeriesManyUpstreams(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+
+	var upstreams []Client
+
+	// First upstream is slow
+	firstUpstream := &testClient{
+		StoreClient: &storeClient{
+			RespSet: []*storepb.SeriesResponse{
+				storepb.NewWarnSeriesResponse(errors.New("partial error")),
+				storeSeriesResponse(t,
+					labels.FromStrings("label_unique_to_upstream", "slow upstream"),
+					[]sample{{1, 1}, {2, 2}, {3, 3}},
+				),
+			},
+		},
+		minTime:       1,
+		maxTime:       300,
+		responseDelay: 6 * time.Second,
+	}
+	upstreams = append(upstreams, firstUpstream)
+
+	for i := 0; i < streamSeriesBufferSize; i++ {
+		upstreams = append(upstreams, &testClient{
+			StoreClient: &storeClient{
+				RespSet: []*storepb.SeriesResponse{
+					storepb.NewWarnSeriesResponse(errors.New("partial error")),
+					storeSeriesResponse(t,
+						labels.FromStrings("label_unique_to_upstream", strconv.Itoa(i)),
+						[]sample{{1, 1}, {2, 2}, {3, 3}},
+					),
+				},
+			},
+			minTime: 1,
+			maxTime: 300,
+		})
+	}
+
+	q := NewProxyStore(
+		nil,
+		func(context.Context) ([]Client, error) { return upstreams, nil },
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv := newStoreSeriesServer(ctx)
+	err := q.Series(
+		&storepb.SeriesRequest{
+			MinTime: 1,
+			MaxTime: 300,
+		},
+		srv)
+	testutil.Ok(t, err)
+
+	// We should have all series given by all our clients.
+	testutil.Equals(t, len(upstreams), len(srv.SeriesSet))
+
+	// We should have all warnings given by all our clients too.
+	testutil.Equals(t, len(upstreams), len(srv.Warnings))
 }
 
 func TestStoreMatches(t *testing.T) {

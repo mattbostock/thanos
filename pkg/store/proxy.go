@@ -19,6 +19,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const streamSeriesBufferSize = 10
+
 // Client holds meta information about a store.
 type Client interface {
 	// Client to access the store.
@@ -84,7 +86,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 	}
 
 	var (
-		respCh    = make(chan *storepb.SeriesResponse, 10)
+		respCh    = make(chan *storepb.SeriesResponse, streamSeriesBufferSize)
 		seriesSet []storepb.SeriesSet
 		g         errgroup.Group
 	)
@@ -119,7 +121,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			continue
 		}
 
-		seriesSet = append(seriesSet, startStreamSeriesSet(sc, respCh, 10))
+		seriesSet = append(seriesSet, startStreamSeriesSet(sc, respCh, streamSeriesBufferSize))
 	}
 	if len(seriesSet) == 0 {
 		err := errors.New("No store matched for this query")
