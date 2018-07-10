@@ -247,6 +247,46 @@ func TestProxyStore_SeriesManyUpstreams(t *testing.T) {
 	testutil.Equals(t, len(upstreams), len(srv.Warnings))
 }
 
+func TestProxyStore_SeriesIncludesTimeOuts(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+
+	slowUpstream := &testClient{
+		StoreClient: &storeClient{
+			RespSet: []*storepb.SeriesResponse{
+				storeSeriesResponse(t,
+					labels.FromStrings("a", "b"),
+					[]sample{{1, 1}, {2, 2}, {3, 3}},
+				),
+			},
+		},
+		minTime:       1,
+		maxTime:       300,
+		responseDelay: 2 * time.Millisecond,
+	}
+
+	q := NewProxyStore(
+		nil,
+		func(context.Context) ([]Client, error) { return []Client{slowUpstream}, nil },
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	srv := newStoreSeriesServer(ctx)
+	err := q.Series(
+		&storepb.SeriesRequest{
+			MinTime: 1,
+			MaxTime: 300,
+		},
+		srv)
+	testutil.Ok(t, err)
+
+	testutil.Equals(t, 0, len(srv.SeriesSet))
+
+	// A slow upstream whose context times out should appear in warnings
+	testutil.Equals(t, 1, len(srv.Warnings))
+}
+
 func TestStoreMatches(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 

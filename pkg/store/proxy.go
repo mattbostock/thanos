@@ -123,12 +123,6 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 
 		seriesSet = append(seriesSet, startStreamSeriesSet(sc, respCh, streamSeriesBufferSize))
 	}
-	if len(seriesSet) == 0 {
-		err := errors.New("No store matched for this query")
-		level.Warn(s.logger).Log("err", err)
-		respCh <- storepb.NewWarnSeriesResponse(err)
-		return nil
-	}
 
 	g.Go(func() error {
 		defer close(respCh)
@@ -142,16 +136,21 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		return mergedSet.Err()
 	})
 
+	if err := g.Wait(); err != nil {
+		level.Error(s.logger).Log("err", err)
+		return err
+	}
+
 	for resp := range respCh {
 		if err := srv.Send(resp); err != nil {
 			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 		}
 	}
 
-	if err := g.Wait(); err != nil {
-		level.Error(s.logger).Log("err", err)
-		return err
+	if len(seriesSet) == 0 {
+		level.Debug(s.logger).Log("err", errors.New("No store matched for this query"))
 	}
+
 	return nil
 
 }
