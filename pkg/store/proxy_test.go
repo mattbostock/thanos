@@ -23,10 +23,25 @@ import (
 type testClient struct {
 	// Just to pass interface check.
 	storepb.StoreClient
+	responseDelay time.Duration
 
 	labels  []storepb.Label
 	minTime int64
 	maxTime int64
+}
+
+func (c *testClient) Series(ctx context.Context, in *storepb.SeriesRequest, opts ...grpc.CallOption) (storepb.Store_SeriesClient, error) {
+	// Use time.After with select to delay the response but still allow a
+	// context timeout to interrupt the delay.
+	delay := time.After(c.responseDelay)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-delay:
+		break
+	}
+
+	return c.StoreClient.Series(ctx, in, opts...)
 }
 
 func (c *testClient) Labels() []storepb.Label {
